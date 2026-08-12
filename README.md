@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 
-一个基于 NcatBot 框架的群聊内容分析插件，自动记录群聊消息并使用 SQLite3 存储，通过 matplotlib 生成丰富的分析图表。
+一个基于 NcatBot 5 框架的群聊内容分析插件，自动记录群聊消息并使用 SQLite3 存储，通过 matplotlib 生成丰富的分析图表。
 
 ## ✨ 功能特性
 
@@ -23,14 +23,14 @@
 ## 📋 系统要求
 
 - Python 3.10+
-- NcatBot 框架
-- 依赖：matplotlib, numpy, jieba, wordcloud
+- NcatBot 5.5.7+（`registrar` 命令系统、`NcatBotPlugin` 基类、多平台 `api.qq` 架构）
+- 依赖：matplotlib, numpy, jieba, wordcloud（框架可按 `manifest.toml` 的 `[pip_dependencies]` 自动安装）
 
 ## 🚀 安装方法
 
 ### 手动安装
 
-将插件源码放置到你的 `plugins` 目录下：
+将插件源码放置到你的 `plugins` 目录下（含 `manifest.toml`，框架自动识别并加载）：
 
 ```bash
 git clone https://github.com/Yang-qwq/group-chat-analyzer.git plugins/group_chat_analyzer
@@ -51,7 +51,12 @@ pip install -r requirements.txt
 
 ## ⚙️ 配置说明
 
-插件会自动加载，无需额外配置。数据库存储在插件工作区，图表临时存储在系统临时目录中。
+插件会自动加载，无需额外配置。数据库存储在插件工作区 `data/group_chat_analyzer/`，图表临时存储在系统临时目录中。
+
+配置采用 NcatBot 5 双层模型：默认值在插件 `on_load()` 通过 `init_defaults()` 注册（下表），可在全局 `config.yaml` 的 `plugin.plugin_configs.group_chat_analyzer` 下覆盖（如 `EnableAutoRecord: false`）。
+
+> 🔑 **管理员权限（RBAC）**：管理命令（`/gcpurge`、`/gcdb`、`/gcautosend`）不再校验 QQ 群管理身份，改为校验 RBAC 权限
+> `group_chat_analyzer.admin`。需通过 NcatBot 的 RBAC 机制为使用者或角色授予该权限，未授权时插件会回复"权限不足"。
 
 ### 配置项
 
@@ -110,7 +115,7 @@ pip install -r requirements.txt
 /gcmonthly help
 ```
 
-### 管理命令（管理员专用）
+### 管理命令（管理员专用，需 RBAC 权限 `group_chat_analyzer.admin`）
 
 ```bash
 # 清理旧数据（默认 30 天）
@@ -157,7 +162,7 @@ GitHub 贡献墙风格，展示每日活跃强度
 
 ## 🗄️ 数据存储
 
-插件使用 SQLite3 存储数据，包含以下表：
+插件使用 SQLite3 存储数据（`data/group_chat_analyzer/group_chat_data.db`），包含以下表：
 
 ### group_messages
 群聊消息记录表
@@ -172,6 +177,7 @@ GitHub 贡献墙风格，展示每日活跃强度
 
 ```
 group_chat_analyzer/
+├── manifest.toml        # 插件清单（必填，框架据此加载）
 ├── __init__.py          # 插件初始化
 ├── main.py              # 插件主入口
 ├── database.py          # 数据库模块
@@ -179,8 +185,13 @@ group_chat_analyzer/
 ├── command_handler.py   # 命令处理模块
 ├── requirements.txt     # Python 依赖
 ├── Pipfile              # Pipenv 依赖管理
+├── AGENTS.md            # 开发约定（子模块维护）
 ├── README.md            # 说明文档
 └── LICENSE              # AGPL 许可证
+
+运行时数据：
+├── data/group_chat_analyzer/data.json          # 自动发送计划（DataMixin 持久化）
+└── data/group_chat_analyzer/group_chat_data.db # SQLite 消息库
 ```
 
 ## 🔧 故障排除
