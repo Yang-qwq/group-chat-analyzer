@@ -1,0 +1,12 @@
+name = "group_chat_analyzer"
+version = "0.1.0"
+main = "main.py"
+entry_class = "GroupChatAnalyzerPlugin"
+author = "Yang-qwq"
+description = "群聊内容分析插件：自动记录群消息到 SQLite，生成统计图表与自动发送总结"
+
+[pip_dependencies]
+matplotlib = ">=3.10.5"
+numpy = ">=2.0.0"
+jieba = ">=0.42.1"
+wordcloud = ">=1.9.4"
