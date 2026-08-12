@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 import base64
 import shlex
+from typing import Optional
 
-from ncatbot.core import BaseMessage, GroupMessage, PrivateMessage, MessageChain, Image
+from ncatbot.core import registrar
+from ncatbot.event.qq import GroupMessageEvent, MessageEvent
 from ncatbot.utils.logger import get_log
 
 _log = get_log('group_chat_analyzer')
@@ -105,18 +107,40 @@ class GroupChatAnalyzerCommandMixin:
         :param caption: 图片说明文字
         """
         try:
-            message_chain = [caption]
-            if self.config.get('ForceBase64ImageSend', False):
+            image_ref = chart_path
+            if self.get_config('ForceBase64ImageSend', False):
                 with open(chart_path, 'rb') as f:
                     image_data = f.read()
                 chart_b64 = base64.b64encode(image_data).decode('utf-8')
-                message_chain.append(Image('data:image/png;base64,' + chart_b64))
-            else:
-                message_chain.append(Image(chart_path))
-            await event.reply(rtf=MessageChain(message_chain))
+                image_ref = 'data:image/png;base64,' + chart_b64
+            await event.reply(text=caption, image=image_ref, at_sender=False)
         except Exception as e:
             _log.error(f'发送图片失败: {e}')
-            await event.reply_text(f'发送图片失败: {e}')
+            await event.reply(text=f'发送图片失败: {e}', at_sender=False)
+
+    async def _safe_params(self, event) -> Optional[list]:
+        """对消息原始文本做 shlex 分词并去掉命令 token
+
+        :param event: 消息事件
+        :return: 参数列表；解析失败时回复错误并返回 None
+        """
+        try:
+            return shlex.split(event.raw_message.replace('\\\\n', '\n'))[1:]
+        except ValueError as e:
+            _log.warning(f'命令解析失败: {e}')
+            await event.reply(text='命令格式错误，请检查引号是否匹配！', at_sender=False)
+            return None
+
+    async def _check_admin(self, event) -> bool:
+        """校验管理员权限（RBAC）
+
+        :param event: 消息事件
+        :return: 是否拥有权限
+        """
+        if self.check_permission(str(event.user_id), 'group_chat_analyzer.admin'):
+            return True
+        await event.reply(text='权限不足：该命令需要管理员权限', at_sender=False)
+        return False
 
     @staticmethod
     def _validate_hours(hours: int) -> bool:
@@ -141,35 +165,35 @@ class GroupChatAnalyzerCommandMixin:
 
         :param event: 消息事件
         """
-        if event.message_type != 'group':
+        if not isinstance(event, GroupMessageEvent):
             return
         try:
-            result = await self.api.get_group_member_list(event.group_id, no_cache=True)
-            data = result.get('data') if isinstance(result, dict) else result
-            if not data:
-                return
-            for member in data:
-                uid = member.get('user_id')
-                nickname = member.get('nickname') or member.get('card') or str(uid)
+            members = await self.api.qq.query.get_group_member_list(event.group_id)
+            for member in members:
+                uid = member.user_id
+                nickname = member.nickname or member.card or str(uid)
                 if uid:
                     self.db.save_user_name(uid, nickname)
         except Exception as e:
             _log.warning(f'刷新用户名缓存失败: {e}')
 
-    async def handle_analyze_command(self, event: BaseMessage | GroupMessage | PrivateMessage,
-                                     command: list) -> None:
+    @registrar.qq.on_command('/gcanalyze')
+    async def on_analyze(self, event: MessageEvent):
         """处理 /gcanalyze 命令，生成群聊分析图表
 
         :param event: 消息事件
-        :param command: 命令参数列表
         :return: None
         """
-        if event.message_type != 'group':
-            await event.reply_text('该命令仅在群聊中可用')
+        if not isinstance(event, GroupMessageEvent):
+            await event.reply(text='该命令仅在群聊中可用', at_sender=False)
             return
 
-        if len(command) > 1 and command[1] == 'help':
-            await event.reply_text(ANALYZE_HELP_TEXT)
+        params = await self._safe_params(event)
+        if params is None:
+            return
+
+        if params and params[0] == 'help':
+            await event.reply(text=ANALYZE_HELP_TEXT, at_sender=False)
             return
 
         group_id = event.group_id
@@ -178,37 +202,37 @@ class GroupChatAnalyzerCommandMixin:
         days = 7
         max_words = 100
 
-        if len(command) > 1:
-            if command[1] in ('trend', 'hourly', 'daily', 'ranking', 'wordcloud'):
-                subcommand = command[1]
-                if len(command) > 2:
+        if params:
+            if params[0] in ('trend', 'hourly', 'daily', 'ranking', 'wordcloud'):
+                subcommand = params[0]
+                if len(params) > 1:
                     try:
                         if subcommand in ('trend', 'hourly', 'ranking', 'wordcloud'):
-                            hours = int(command[2])
+                            hours = int(params[1])
                             if not self._validate_hours(hours):
-                                await event.reply_text('小时数必须在 1-8760 之间')
+                                await event.reply(text='小时数必须在 1-8760 之间', at_sender=False)
                                 return
-                            if subcommand == 'wordcloud' and len(command) > 3:
-                                max_words = int(command[3])
+                            if subcommand == 'wordcloud' and len(params) > 2:
+                                max_words = int(params[2])
                                 if max_words < 1 or max_words > 1000:
-                                    await event.reply_text('最大词数必须在 1-1000 之间')
+                                    await event.reply(text='最大词数必须在 1-1000 之间', at_sender=False)
                                     return
                         elif subcommand == 'daily':
-                            days = int(command[2])
+                            days = int(params[1])
                             if not self._validate_days(days):
-                                await event.reply_text('天数必须在 1-365 之间')
+                                await event.reply(text='天数必须在 1-365 之间', at_sender=False)
                                 return
                     except ValueError:
-                        await event.reply_text('时间参数必须是有效的数字')
+                        await event.reply(text='时间参数必须是有效的数字', at_sender=False)
                         return
             else:
                 try:
-                    hours = int(command[1])
+                    hours = int(params[0])
                     if not self._validate_hours(hours):
-                        await event.reply_text('小时数必须在 1-8760 之间')
+                        await event.reply(text='小时数必须在 1-8760 之间', at_sender=False)
                         return
                 except ValueError:
-                    await event.reply_text('无效的参数，请使用 /gcanalyze help 查看帮助')
+                    await event.reply(text='无效的参数，请使用 /gcanalyze help 查看帮助', at_sender=False)
                     return
 
         # daily 子命令按天数检查；其余按小时检查，避免近 24h 无消息却误拒 daily
@@ -223,12 +247,13 @@ class GroupChatAnalyzerCommandMixin:
         if total_messages == 0:
             all_messages = self.db.get_total_messages_count(group_id)
             if all_messages == 0:
-                await event.reply_text('数据库中尚无群聊消息记录，请确保已开启消息监听并收到过消息')
+                await event.reply(text='数据库中尚无群聊消息记录，请确保已开启消息监听并收到过消息',
+                                   at_sender=False)
             else:
-                await event.reply_text(empty_hint)
+                await event.reply(text=empty_hint, at_sender=False)
             return
 
-        await event.reply_text(f'正在生成分析图表，请稍候...')
+        await event.reply(text='正在生成分析图表，请稍候...', at_sender=False)
         await self._refresh_user_names(event)
 
         try:
@@ -247,7 +272,7 @@ class GroupChatAnalyzerCommandMixin:
                 if chart_path:
                     await self._send_image(event, chart_path, '综合分析报告已生成')
                 else:
-                    await event.reply_text('生成综合分析报告失败')
+                    await event.reply(text='生成综合分析报告失败', at_sender=False)
                 return
 
             if subcommand == 'trend':
@@ -256,7 +281,7 @@ class GroupChatAnalyzerCommandMixin:
                 if chart_path:
                     await self._send_image(event, chart_path, '消息趋势图已生成')
                 else:
-                    await event.reply_text('生成消息趋势图失败')
+                    await event.reply(text='生成消息趋势图失败', at_sender=False)
                 return
 
             if subcommand == 'hourly':
@@ -265,7 +290,7 @@ class GroupChatAnalyzerCommandMixin:
                 if chart_path:
                     await self._send_image(event, chart_path, '时段活跃度图已生成')
                 else:
-                    await event.reply_text('生成时段活跃度图失败')
+                    await event.reply(text='生成时段活跃度图失败', at_sender=False)
                 return
 
             if subcommand == 'daily':
@@ -274,7 +299,7 @@ class GroupChatAnalyzerCommandMixin:
                 if chart_path:
                     await self._send_image(event, chart_path, '日活跃度趋势图已生成')
                 else:
-                    await event.reply_text('生成日活跃度趋势图失败')
+                    await event.reply(text='生成日活跃度趋势图失败', at_sender=False)
                 return
 
             if subcommand == 'ranking':
@@ -283,7 +308,7 @@ class GroupChatAnalyzerCommandMixin:
                 if chart_path:
                     await self._send_image(event, chart_path, '发言排行榜已生成')
                 else:
-                    await event.reply_text('生成发言排行榜失败')
+                    await event.reply(text='生成发言排行榜失败', at_sender=False)
                 return
 
             if subcommand == 'wordcloud':
@@ -293,38 +318,41 @@ class GroupChatAnalyzerCommandMixin:
                 if chart_path:
                     await self._send_image(event, chart_path, '词云图已生成')
                 else:
-                    await event.reply_text('生成词云图失败，可能最近消息内容不足以生成词云')
+                    await event.reply(text='生成词云图失败，可能最近消息内容不足以生成词云', at_sender=False)
                 return
 
         except Exception as e:
             _log.error(f'生成分析图表时发生错误: {e}')
-            await event.reply_text(f'生成分析图表时发生错误: {e}')
+            await event.reply(text=f'生成分析图表时发生错误: {e}', at_sender=False)
 
-    async def handle_stats_command(self, event: BaseMessage | GroupMessage | PrivateMessage,
-                                    command: list) -> None:
+    @registrar.qq.on_command('/gcstats')
+    async def on_stats(self, event: MessageEvent):
         """处理 /gcstats 命令，查看群聊统计信息
 
         :param event: 消息事件
-        :param command: 命令参数列表
         :return: None
         """
-        if event.message_type != 'group':
-            await event.reply_text('该命令仅在群聊中可用')
+        if not isinstance(event, GroupMessageEvent):
+            await event.reply(text='该命令仅在群聊中可用', at_sender=False)
             return
 
-        if len(command) > 1 and command[1] == 'help':
-            await event.reply_text(STATS_HELP_TEXT)
+        params = await self._safe_params(event)
+        if params is None:
+            return
+
+        if params and params[0] == 'help':
+            await event.reply(text=STATS_HELP_TEXT, at_sender=False)
             return
 
         group_id = event.group_id
 
         try:
-            hours = int(command[1]) if len(command) > 1 else 24
+            hours = int(params[0]) if params else 24
             if not self._validate_hours(hours):
-                await event.reply_text('小时数必须在 1-8760 之间')
+                await event.reply(text='小时数必须在 1-8760 之间', at_sender=False)
                 return
         except ValueError:
-            await event.reply_text('小时数必须是有效的数字')
+            await event.reply(text='小时数必须是有效的数字', at_sender=False)
             return
 
         await self._refresh_user_names(event)
@@ -336,7 +364,7 @@ class GroupChatAnalyzerCommandMixin:
             user_stats = self.db.get_most_active_users(group_id, hours, 5)
         except Exception as e:
             _log.error(f'获取统计信息失败: {e}')
-            await event.reply_text('获取统计信息时发生错误，请稍后重试')
+            await event.reply(text='获取统计信息时发生错误，请稍后重试', at_sender=False)
             return
 
         stats_lines = [
@@ -354,38 +382,41 @@ class GroupChatAnalyzerCommandMixin:
             for i, user in enumerate(user_stats, 1):
                 stats_lines.append(f'  {i}. {user["user_name"]} — {user["message_count"]} 条消息')
 
-        await event.reply_text('\n'.join(stats_lines))
+        await event.reply(text='\n'.join(stats_lines), at_sender=False)
 
-    async def handle_top_command(self, event: BaseMessage | GroupMessage | PrivateMessage,
-                                  command: list) -> None:
+    @registrar.qq.on_command('/gctop')
+    async def on_top(self, event: MessageEvent):
         """处理 /gctop 命令，查看发言排行榜文本版
 
         :param event: 消息事件
-        :param command: 命令参数列表
         :return: None
         """
-        if event.message_type != 'group':
-            await event.reply_text('该命令仅在群聊中可用')
+        if not isinstance(event, GroupMessageEvent):
+            await event.reply(text='该命令仅在群聊中可用', at_sender=False)
             return
 
-        if len(command) > 1 and command[1] == 'help':
-            await event.reply_text(TOP_HELP_TEXT)
+        params = await self._safe_params(event)
+        if params is None:
+            return
+
+        if params and params[0] == 'help':
+            await event.reply(text=TOP_HELP_TEXT, at_sender=False)
             return
 
         group_id = event.group_id
 
         try:
-            limit = int(command[1]) if len(command) > 1 else 10
-            hours = int(command[2]) if len(command) > 2 else 24
+            limit = int(params[0]) if params else 10
+            hours = int(params[1]) if len(params) > 1 else 24
         except ValueError:
-            await event.reply_text('参数必须是有效的数字')
+            await event.reply(text='参数必须是有效的数字', at_sender=False)
             return
 
         if limit < 1 or limit > 50:
-            await event.reply_text('显示数量必须在 1-50 之间')
+            await event.reply(text='显示数量必须在 1-50 之间', at_sender=False)
             return
         if not self._validate_hours(hours):
-            await event.reply_text('小时数必须在 1-8760 之间')
+            await event.reply(text='小时数必须在 1-8760 之间', at_sender=False)
             return
 
         await self._refresh_user_names(event)
@@ -394,11 +425,11 @@ class GroupChatAnalyzerCommandMixin:
             user_stats = self.db.get_most_active_users(group_id, hours, limit)
         except Exception as e:
             _log.error(f'获取排行榜数据失败: {e}')
-            await event.reply_text('获取排行榜数据时发生错误，请稍后重试')
+            await event.reply(text='获取排行榜数据时发生错误，请稍后重试', at_sender=False)
             return
 
         if not user_stats:
-            await event.reply_text(f'最近 {hours} 小时内无消息记录')
+            await event.reply(text=f'最近 {hours} 小时内无消息记录', at_sender=False)
             return
 
         lines = [f'🏆 发言排行榜 TOP{min(limit, len(user_stats))}（最近 {hours} 小时）：', '']
@@ -407,42 +438,46 @@ class GroupChatAnalyzerCommandMixin:
             medal = medals[i - 1] if i <= 3 else f'{i}.'
             lines.append(f'  {medal} {user["user_name"]} — {user["message_count"]} 条消息')
 
-        await event.reply_text('\n'.join(lines))
+        await event.reply(text='\n'.join(lines), at_sender=False)
 
-    async def handle_monthly_command(self, event: BaseMessage | GroupMessage | PrivateMessage,
-                                     command: list) -> None:
+    @registrar.qq.on_command('/gcmonthly')
+    async def on_monthly(self, event: MessageEvent):
         """处理 /gcmonthly 命令，生成月度活跃热力图
 
         :param event: 消息事件
-        :param command: 命令参数列表
         :return: None
         """
-        if event.message_type != 'group':
-            await event.reply_text('该命令仅在群聊中可用')
+        if not isinstance(event, GroupMessageEvent):
+            await event.reply(text='该命令仅在群聊中可用', at_sender=False)
             return
 
-        if len(command) > 1 and command[1] == 'help':
-            await event.reply_text(MONTHLY_HELP_TEXT)
+        params = await self._safe_params(event)
+        if params is None:
+            return
+
+        if params and params[0] == 'help':
+            await event.reply(text=MONTHLY_HELP_TEXT, at_sender=False)
             return
 
         group_id = event.group_id
 
         try:
-            months = int(command[1]) if len(command) > 1 else 6
+            months = int(params[0]) if params else 6
         except ValueError:
-            await event.reply_text('月数必须是有效的数字')
+            await event.reply(text='月数必须是有效的数字', at_sender=False)
             return
 
         if months < 1 or months > 12:
-            await event.reply_text('月数必须在 1-12 之间')
+            await event.reply(text='月数必须在 1-12 之间', at_sender=False)
             return
 
         total_messages = self.db.get_total_messages_count(group_id)
         if total_messages == 0:
-            await event.reply_text('数据库中尚无群聊消息记录，请确保已开启消息监听并收到过消息')
+            await event.reply(text='数据库中尚无群聊消息记录，请确保已开启消息监听并收到过消息',
+                               at_sender=False)
             return
 
-        await event.reply_text(f'正在生成最近 {months} 个月的活跃热力图，请稍候...')
+        await event.reply(text=f'正在生成最近 {months} 个月的活跃热力图，请稍候...', at_sender=False)
 
         try:
             daily_data = self.db.get_daily_activity(group_id, months * 30)
@@ -451,50 +486,57 @@ class GroupChatAnalyzerCommandMixin:
             if chart_path:
                 await self._send_image(event, chart_path, '月度活跃热力图已生成')
             else:
-                await event.reply_text('生成月度活跃热力图失败，可能数据量不足')
+                await event.reply(text='生成月度活跃热力图失败，可能数据量不足', at_sender=False)
         except Exception as e:
             _log.error(f'生成月度热力图时发生错误: {e}')
-            await event.reply_text(f'生成月度热力图时发生错误: {e}')
+            await event.reply(text=f'生成月度热力图时发生错误: {e}', at_sender=False)
 
-    async def handle_purge_command(self, event: BaseMessage | GroupMessage | PrivateMessage,
-                                    command: list) -> None:
-        """处理 /gcpurge 命令，清理旧数据
+    @registrar.qq.on_command('/gcpurge')
+    async def on_purge(self, event: MessageEvent):
+        """处理 /gcpurge 命令，清理旧数据（管理员专用）
 
         :param event: 消息事件
-        :param command: 命令参数列表
         :return: None
         """
-        if len(command) > 1 and command[1] == 'help':
-            await event.reply_text(PURGE_HELP_TEXT)
+        if not await self._check_admin(event):
+            return
+
+        params = await self._safe_params(event)
+        if params is None:
+            return
+
+        if params and params[0] == 'help':
+            await event.reply(text=PURGE_HELP_TEXT, at_sender=False)
             return
 
         try:
-            if len(command) < 2:
-                days = 30
-            else:
+            if params:
                 try:
-                    days = int(command[1])
+                    days = int(params[0])
                 except ValueError:
-                    await event.reply_text('保留天数必须是有效的数字')
+                    await event.reply(text='保留天数必须是有效的数字', at_sender=False)
                     return
+            else:
+                days = 30
 
             if days < 1:
-                await event.reply_text('保留天数必须大于 0')
+                await event.reply(text='保留天数必须大于 0', at_sender=False)
                 return
             if days > 365:
-                await event.reply_text('保留天数不能超过 365 天')
+                await event.reply(text='保留天数不能超过 365 天', at_sender=False)
                 return
 
-            config_retention = self.config.get('DataRetentionDays', 0)
+            config_retention = self.get_config('DataRetentionDays', 0)
             if isinstance(config_retention, str):
                 config_retention = int(config_retention.split('|')[-1])
             if config_retention > 0 and days < config_retention:
-                await event.reply_text(
-                    f'保留天数不能小于配置的最小值 {config_retention} 天，'
-                    f'请使用 /gcpurge {config_retention} 或更大的数值')
+                await event.reply(
+                    text=f'保留天数不能小于配置的最小值 {config_retention} 天，'
+                         f'请使用 /gcpurge {config_retention} 或更大的数值',
+                    at_sender=False)
                 return
 
-            await event.reply_text(f'正在清理超过 {days} 天的旧数据，请稍候...')
+            await event.reply(text=f'正在清理超过 {days} 天的旧数据，请稍候...', at_sender=False)
             deleted_count = self.db.cleanup_old_data(days)
 
             lines = [
@@ -502,25 +544,32 @@ class GroupChatAnalyzerCommandMixin:
                 f'• 清理记录数：{deleted_count} 条',
                 f'• 保留天数：{days} 天'
             ]
-            await event.reply_text('\n'.join(lines))
+            await event.reply(text='\n'.join(lines), at_sender=False)
 
         except Exception as e:
             _log.error(f'清理数据时发生错误: {e}')
-            await event.reply_text(f'清理数据时发生错误: {e}')
+            await event.reply(text=f'清理数据时发生错误: {e}', at_sender=False)
 
-    async def handle_db_command(self, event: BaseMessage | GroupMessage | PrivateMessage) -> None:
-        """处理 /gcdb 命令，查看数据库统计
+    @registrar.qq.on_command('/gcdb')
+    async def on_db(self, event: MessageEvent):
+        """处理 /gcdb 命令，查看数据库统计（管理员专用）
 
         :param event: 消息事件
         :return: None
         """
-        try:
-            raw = event.raw_message.strip()
-            if raw.lower().endswith('help') or raw == '/gcdb help':
-                await event.reply_text(DB_HELP_TEXT)
-                return
+        if not await self._check_admin(event):
+            return
 
-            if event.message_type != 'group':
+        params = await self._safe_params(event)
+        if params is None:
+            return
+
+        if params and params[0] == 'help':
+            await event.reply(text=DB_HELP_TEXT, at_sender=False)
+            return
+
+        try:
+            if not isinstance(event, GroupMessageEvent):
                 total_messages = self.db.get_total_messages_count(0)
                 db_size_mb = self.db.get_db_size_mb()
                 lines = [
@@ -530,7 +579,7 @@ class GroupChatAnalyzerCommandMixin:
                     f'  • 数据库大小：{db_size_mb} MB',
                     f'  • 数据库路径：{self.db.db_path}',
                 ]
-                await event.reply_text('\n'.join(lines))
+                await event.reply(text='\n'.join(lines), at_sender=False)
                 return
 
             group_id = event.group_id
@@ -556,35 +605,40 @@ class GroupChatAnalyzerCommandMixin:
                 f'  • 数据库大小：{db_size_mb} MB',
                 f'  • 数据库路径：{self.db.db_path}',
             ]
-            await event.reply_text('\n'.join(lines))
+            await event.reply(text='\n'.join(lines), at_sender=False)
 
         except Exception as e:
             _log.error(f'获取数据库统计失败: {e}')
-            await event.reply_text(f'获取数据库统计失败: {e}')
+            await event.reply(text=f'获取数据库统计失败: {e}', at_sender=False)
 
-    async def handle_autosend_command(self, event: BaseMessage | GroupMessage | PrivateMessage,
-                                       command: list) -> None:
-        """处理 /gcautosend 命令，配置群聊自动发送计划
+    @registrar.qq.on_command('/gcautosend')
+    async def on_autosend(self, event: MessageEvent):
+        """处理 /gcautosend 命令，配置群聊自动发送计划（管理员专用）
 
         :param event: 消息事件
-        :param command: 命令参数列表
         :return: None
         """
-        if event.message_type != 'group':
-            await event.reply_text('该命令仅在群聊中可用')
+        if not isinstance(event, GroupMessageEvent):
+            await event.reply(text='该命令仅在群聊中可用', at_sender=False)
+            return
+        if not await self._check_admin(event):
+            return
+
+        params = await self._safe_params(event)
+        if params is None:
             return
 
         group_id = str(event.group_id)
-        plans = self.data['data'].setdefault('auto_summary_plans', {})
+        plans = self.data.setdefault('auto_summary_plans', {})
 
-        if len(command) < 2 or command[1] == 'help':
-            await event.reply_text(AUTO_SEND_HELP_TEXT)
+        if len(params) < 1 or params[0] == 'help':
+            await event.reply(text=AUTO_SEND_HELP_TEXT, at_sender=False)
             return
 
-        subcommand = command[1]
+        subcommand = params[0]
 
         if subcommand == 'set':
-            args = command[2:]
+            args = params[1:]
 
             # 没有额外参数 -> 用默认值创建
             if not args:
@@ -597,13 +651,14 @@ class GroupChatAnalyzerCommandMixin:
                     'last_send': '',
                 }
                 await self._register_auto_summary_plan(group_id, plans[group_id])
-                self.data.save()
-                await event.reply_text('✅ 已为本群创建自动发送计划（每日 22:00 发送日报）')
+                self._save_data()
+                await event.reply(text='✅ 已为本群创建自动发送计划（每日 22:00 发送日报）',
+                                   at_sender=False)
                 return
 
             # key value 成对解析
             if len(args) % 2 != 0:
-                await event.reply_text('参数格式错误，请使用 key value 成对传入')
+                await event.reply(text='参数格式错误，请使用 key value 成对传入', at_sender=False)
                 return
 
             if group_id not in plans:
@@ -625,7 +680,8 @@ class GroupChatAnalyzerCommandMixin:
 
                 if key == 'interval':
                     if value not in ('daily', 'weekly', 'monthly'):
-                        await event.reply_text(f'无效周期: {value}，可选 daily/weekly/monthly')
+                        await event.reply(text=f'无效周期: {value}，可选 daily/weekly/monthly',
+                                           at_sender=False)
                         return
                     plan['interval'] = value
                     plan['last_send'] = ''
@@ -633,19 +689,19 @@ class GroupChatAnalyzerCommandMixin:
 
                 elif key == 'time':
                     if ':' not in value:
-                        await event.reply_text('无效时间格式，请使用 HH:MM（如 22:00）')
+                        await event.reply(text='无效时间格式，请使用 HH:MM（如 22:00）', at_sender=False)
                         return
                     parts = value.split(':')
                     if len(parts) != 2:
-                        await event.reply_text('无效时间格式，请使用 HH:MM（如 22:00）')
+                        await event.reply(text='无效时间格式，请使用 HH:MM（如 22:00）', at_sender=False)
                         return
                     try:
                         h, m = int(parts[0]), int(parts[1])
                     except ValueError:
-                        await event.reply_text('无效时间格式，请使用 HH:MM（如 22:00）')
+                        await event.reply(text='无效时间格式，请使用 HH:MM（如 22:00）', at_sender=False)
                         return
                     if h < 0 or h > 23 or m < 0 or m > 59:
-                        await event.reply_text('无效时间格式，请使用 HH:MM（如 22:00）')
+                        await event.reply(text='无效时间格式，请使用 HH:MM（如 22:00）', at_sender=False)
                         return
                     normalized = f'{h:02d}:{m:02d}'
                     plan['time'] = normalized
@@ -656,10 +712,10 @@ class GroupChatAnalyzerCommandMixin:
                     try:
                         wd = int(value)
                     except (ValueError, TypeError):
-                        await event.reply_text('weekday 必须是 0-6 的整数（0=周一）')
+                        await event.reply(text='weekday 必须是 0-6 的整数（0=周一）', at_sender=False)
                         return
                     if wd < 0 or wd > 6:
-                        await event.reply_text('weekday 必须是 0-6 的整数（0=周一）')
+                        await event.reply(text='weekday 必须是 0-6 的整数（0=周一）', at_sender=False)
                         return
                     plan['weekday'] = wd
                     plan['last_send'] = ''
@@ -669,10 +725,10 @@ class GroupChatAnalyzerCommandMixin:
                     try:
                         md = int(value)
                     except (ValueError, TypeError):
-                        await event.reply_text('monthday 必须是 1-31 的整数')
+                        await event.reply(text='monthday 必须是 1-31 的整数', at_sender=False)
                         return
                     if md < 1 or md > 31:
-                        await event.reply_text('monthday 必须是 1-31 的整数')
+                        await event.reply(text='monthday 必须是 1-31 的整数', at_sender=False)
                         return
                     plan['monthday'] = md
                     plan['last_send'] = ''
@@ -682,34 +738,36 @@ class GroupChatAnalyzerCommandMixin:
                     try:
                         s = int(value)
                     except (ValueError, TypeError):
-                        await event.reply_text('scope 必须是非负整数（小时数，0=自动）')
+                        await event.reply(text='scope 必须是非负整数（小时数，0=自动）', at_sender=False)
                         return
                     if s < 0:
-                        await event.reply_text('scope 必须是非负整数（小时数，0=自动）')
+                        await event.reply(text='scope 必须是非负整数（小时数，0=自动）', at_sender=False)
                         return
                     plan['scope'] = s
                     changed.append(f'统计范围={"自动" if s == 0 else f"{s}h"}')
 
                 else:
-                    await event.reply_text(f'未知参数: {key}，支持 interval/time/weekday/monthday/scope')
+                    await event.reply(
+                        text=f'未知参数: {key}，支持 interval/time/weekday/monthday/scope',
+                        at_sender=False)
                     return
 
             await self._register_auto_summary_plan(group_id, plan)
-            self.data.save()
-            await event.reply_text(f'✅ 已更新自动发送计划: {", ".join(changed)}')
+            self._save_data()
+            await event.reply(text=f'✅ 已更新自动发送计划: {", ".join(changed)}', at_sender=False)
 
         elif subcommand == 'remove':
             if group_id not in plans:
-                await event.reply_text('❌ 本群未设置自动发送计划')
+                await event.reply(text='❌ 本群未设置自动发送计划', at_sender=False)
                 return
             del plans[group_id]
             self.remove_scheduled_task(f'auto_summary_{group_id}')
-            self.data.save()
-            await event.reply_text('✅ 已删除本群自动发送计划')
+            self._save_data()
+            await event.reply(text='✅ 已删除本群自动发送计划', at_sender=False)
 
         elif subcommand == 'status':
             if group_id not in plans:
-                await event.reply_text('本群未设置自动发送计划')
+                await event.reply(text='本群未设置自动发送计划', at_sender=False)
                 return
 
             plan = plans[group_id]
@@ -731,69 +789,7 @@ class GroupChatAnalyzerCommandMixin:
             lines.append(f'  • 统计范围：{scope_desc}')
             lines.append(f'  • 上次发送：{last_send}')
 
-            await event.reply_text('\n'.join(lines))
+            await event.reply(text='\n'.join(lines), at_sender=False)
 
         else:
-            await event.reply_text(AUTO_SEND_HELP_TEXT)
-
-    async def admin_command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
-        """处理管理员命令事件
-
-        :param event: 消息事件
-        :return: None
-        """
-        replaced_message = event.raw_message.replace('\\\\n', '\n')
-
-        try:
-            command = shlex.split(replaced_message)
-        except ValueError as e:
-            _log.warning(f'管理员命令解析失败: {e}')
-            await event.reply_text('命令格式错误，请检查引号是否匹配！')
-            return
-
-        if not command:
-            return
-
-        try:
-            if command[0] == '/gcpurge':
-                await self.handle_purge_command(event, command)
-            elif command[0] == '/gcdb':
-                await self.handle_db_command(event)
-            elif command[0] == '/gcautosend':
-                await self.handle_autosend_command(event, command)
-        except Exception as e:
-            _log.error(f'处理管理员命令时发生错误: {e}')
-            await event.reply_text('处理命令时发生错误，请稍后重试')
-
-    async def user_command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
-        """处理用户命令事件
-
-        :param event: 消息事件
-        :return: None
-        """
-        replaced_message = event.raw_message.replace('\\\\n', '\n')
-
-        try:
-            command = shlex.split(replaced_message)
-        except ValueError as e:
-            _log.warning(f'用户命令解析失败: {e}')
-            await event.reply_text('命令格式错误，请检查引号是否匹配！')
-            return
-
-        if not command:
-            return
-
-        try:
-            if command[0] == '/gcanalyze':
-                await self.handle_analyze_command(event, command)
-            elif command[0] == '/gcstats':
-                await self.handle_stats_command(event, command)
-            elif command[0] == '/gctop':
-                await self.handle_top_command(event, command)
-            elif command[0] == '/gcmonthly':
-                await self.handle_monthly_command(event, command)
-            else:
-                return
-        except Exception as e:
-            _log.error(f'处理用户命令时发生错误: {e}')
-            await event.reply_text('处理命令时发生错误，请稍后重试')
+            await event.reply(text=AUTO_SEND_HELP_TEXT, at_sender=False)

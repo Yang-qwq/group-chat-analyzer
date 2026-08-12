@@ -1,27 +1,30 @@
 # -*- coding: utf-8 -*-
 import datetime
 import os
+from functools import partial
 
-from ncatbot.core import Image, MessageChain
-from ncatbot.plugin import BasePlugin, CompatibleEnrollment
+from ncatbot.core import registrar
+from ncatbot.event.qq import GroupMessageEvent
+from ncatbot.plugin import NcatBotPlugin
 from ncatbot.utils.logger import get_log
 
 from .command_handler import GroupChatAnalyzerCommandMixin
 from .database import DatabaseManager
 from .analyzer import ChartGenerator
 
-bot = CompatibleEnrollment
 _log = get_log('group_chat_analyzer')
 
 
-class GroupChatAnalyzerPlugin(GroupChatAnalyzerCommandMixin, BasePlugin):
+class GroupChatAnalyzerPlugin(GroupChatAnalyzerCommandMixin, NcatBotPlugin):
     """群聊内容分析插件
 
     自动记录群聊消息到 SQLite 数据库，支持生成多种分析图表。
     支持按群配置每日/每周/每月自动发送群聊分析总结。
     """
-    name = 'GroupChatAnalyzerPlugin'
+    name = 'group_chat_analyzer'
     version = '0.1.0'
+    author = 'Yang-qwq'
+    description = '群聊内容分析插件：自动记录群消息到 SQLite，生成统计图表与自动发送总结'
 
     @staticmethod
     def get_system_temp_dir() -> str | os.PathLike:
@@ -37,88 +40,35 @@ class GroupChatAnalyzerPlugin(GroupChatAnalyzerCommandMixin, BasePlugin):
     async def on_load(self):
         """插件加载时的初始化"""
         try:
-            # 注册配置项
-            self.register_config(
-                'EnableAutoRecord',
-                description='是否自动记录群聊消息到数据库',
-                value_type='bool',
-                default=True,
-            )
-            self.register_config(
-                'ForceBase64ImageSend',
-                description='是否强制使用 Base64 编码发送图片（某些平台需要）',
-                value_type='bool',
-                default=False,
-            )
-            self.register_config(
-                'DataRetentionDays',
-                description='数据保留天数（自动清理），0 表示不自动清理',
-                value_type='int',
-                default=30,
-            )
-            self.register_config(
-                'AutoSendSummary',
-                description='全局总开关：是否允许自动发送群聊总结',
-                value_type='bool',
-                default=False,
-            )
+            # 注册配置默认值
+            self.init_defaults({
+                'EnableAutoRecord': True,
+                'ForceBase64ImageSend': False,
+                'DataRetentionDays': 30,
+                'AutoSendSummary': False,
+            })
 
-            # 注册用户命令
-            self.register_user_func(
-                '群聊分析命令',
-                self.user_command_handler,
-                prefix='/gc',
-                description='群聊分析报告、词云、热力图及统计信息',
-                usage='/gcanalyze [subcommand] | /gcstats [小时数] | /gctop [数量] [小时数] | /gcmonthly [月数]',
-                examples=[
-                    '/gcanalyze',
-                    '/gcanalyze 48',
-                    '/gcanalyze wordcloud',
-                    '/gcanalyze wordcloud 48 200',
-                    '/gcmonthly',
-                    '/gcmonthly 3',
-                    '/gcstats',
-                    '/gctop 10',
-                ]
-            )
+            # 注册管理命令所需 RBAC 权限
+            self.add_permission('group_chat_analyzer.admin')
 
-            # 注册管理员命令（含自动发送计划配置）
-            self.register_admin_func(
-                '群聊管理命令',
-                self.admin_command_handler,
-                regex=r'^/gc(purge|db|autosend)',
-                description='清理旧数据、查看数据库统计、配置自动发送（管理员专用）',
-                usage='/gcpurge [天数] | /gcdb | /gcautosend set|remove|status|help',
-                examples=[
-                    '/gcpurge',
-                    '/gcpurge 30',
-                    '/gcdb',
-                    '/gcautosend set',
-                    '/gcautosend status',
-                ],
-            )
+            # 初始化数据库（位于插件工作区 data/group_chat_analyzer/）
+            self.db = DatabaseManager(str(self.workspace / 'group_chat_data.db'))
 
-            # 初始化数据库
-            self.db = DatabaseManager(self.work_space.path.as_posix() + '/' + 'group_chat_data.db')
-
-            # 初始化图表生成器
+            # 初始化图表生成器（输出到系统临时目录）
             self.chart_generator = ChartGenerator(self.get_system_temp_dir())
 
             # 初始化持久化数据
-            if 'data' not in self.data:
-                self.data['data'] = {}
-            if 'auto_summary_plans' not in self.data['data']:
-                self.data['data']['auto_summary_plans'] = {}
+            self.data.setdefault('auto_summary_plans', {})
 
             # 注册自动清理任务（每 6 小时执行一次）
             self.add_scheduled_task(
-                self._auto_cleanup_database,
                 'group_chat_cleanup',
                 21600,
+                callback=self._auto_cleanup_database,
             )
 
             # 重新注册已持久化的自动发送计划
-            for gid, plan in self.data['data'].get('auto_summary_plans', {}).items():
+            for gid, plan in self.data.get('auto_summary_plans', {}).items():
                 await self._register_auto_summary_plan(gid, plan)
                 _log.debug(f'已恢复群({gid})自动发送计划：{plan["interval"]} {plan["time"]}')
 
@@ -129,8 +79,8 @@ class GroupChatAnalyzerPlugin(GroupChatAnalyzerCommandMixin, BasePlugin):
             _log.error(f'插件加载初始化失败: {e}')
             raise
 
-    @bot.group_event()
-    async def on_group_message(self, event):
+    @registrar.qq.on_group_message()
+    async def on_group_message(self, event: GroupMessageEvent):
         """处理群消息事件
 
         保存消息到数据库，供后续分析使用。
@@ -139,15 +89,15 @@ class GroupChatAnalyzerPlugin(GroupChatAnalyzerCommandMixin, BasePlugin):
         :return: None
         """
         try:
-            if self.config.get('EnableAutoRecord', True):
+            if self.get_config('EnableAutoRecord', True):
                 self.db.save_user_name(
-                    event.sender.user_id,
+                    int(event.sender.user_id),
                     event.sender.nickname or str(event.sender.user_id),
                 )
-                self.db.increment_user_message_count(event.sender.user_id)
+                self.db.increment_user_message_count(int(event.sender.user_id))
                 self.db.save_message(
-                    group_id=event.group_id,
-                    user_id=event.sender.user_id,
+                    group_id=int(event.group_id),
+                    user_id=int(event.sender.user_id),
                     message=event.raw_message,
                 )
         except Exception as e:
@@ -156,7 +106,7 @@ class GroupChatAnalyzerPlugin(GroupChatAnalyzerCommandMixin, BasePlugin):
     async def _auto_cleanup_database(self):
         """自动清理过期数据，根据 DataRetentionDays 配置执行"""
         try:
-            retention_days = self.config.get('DataRetentionDays', 0)
+            retention_days = self.get_config('DataRetentionDays', 0)
             if isinstance(retention_days, str):
                 retention_days = int(retention_days.split('|')[-1])
             if retention_days > 0:
@@ -178,8 +128,12 @@ class GroupChatAnalyzerPlugin(GroupChatAnalyzerCommandMixin, BasePlugin):
         task_name = f'auto_summary_{group_id}'
         self.remove_scheduled_task(task_name)
 
-        self.add_scheduled_task(self._auto_summary_handler, task_name, plan['time'],
-                                args=(str(group_id),))
+        # v5 无 args 参数，通过 partial 绑定群号
+        self.add_scheduled_task(
+            task_name,
+            plan['time'],
+            callback=partial(self._auto_summary_handler, str(group_id)),
+        )
         _log.info(f'已注册群({group_id})自动发送计划：{plan["interval"]} {plan["time"]}')
 
     async def _auto_summary_handler(self, group_id: str):
@@ -188,11 +142,11 @@ class GroupChatAnalyzerPlugin(GroupChatAnalyzerCommandMixin, BasePlugin):
         :param group_id: 群号
         """
         try:
-            if not self.config.get('AutoSendSummary', False):
+            if not self.get_config('AutoSendSummary', False):
                 _log.debug(f'群({group_id})自动发送已关闭（全局开关），跳过')
                 return
 
-            plans = self.data['data'].get('auto_summary_plans', {})
+            plans = self.data.get('auto_summary_plans', {})
             plan = plans.get(group_id)
             if not plan:
                 _log.debug(f'群({group_id})无自动发送计划，跳过')
@@ -231,7 +185,7 @@ class GroupChatAnalyzerPlugin(GroupChatAnalyzerCommandMixin, BasePlugin):
             sent = await self._execute_auto_send_summary(group_id, scope, interval)
             if sent:
                 plan['last_send'] = current_period
-                self.data.save()
+                self._save_data()
                 _log.info(f'群({group_id})自动{interval}总结发送完成')
             else:
                 _log.debug(f'群({group_id})自动{interval}总结条件不满足，跳过')
@@ -274,21 +228,19 @@ class GroupChatAnalyzerPlugin(GroupChatAnalyzerCommandMixin, BasePlugin):
                 return False
 
             caption = f'📊 群聊分析{period_name}已生成（最近 {hours} 小时，共 {total} 条消息）'
-            message_chain = [caption]
-            if self.config.get('ForceBase64ImageSend', False):
+
+            if self.get_config('ForceBase64ImageSend', False):
                 import base64
                 with open(chart_path, 'rb') as f:
                     image_data = f.read()
-                chart_b64 = base64.b64encode(image_data).decode('utf-8')
-                message_chain.append(Image('data:image/png;base64,' + chart_b64))
+                image_ref = 'data:image/png;base64,' + base64.b64encode(image_data).decode('utf-8')
             else:
-                message_chain.append(Image(chart_path))
+                image_ref = chart_path
 
-            await self.api.post_group_msg(gid, rtf=MessageChain(message_chain))
+            await self.api.qq.post_group_msg(gid, text=caption, image=image_ref)
             _log.info(f'已向群({group_id})发送{period_name}（{total} 条消息）')
             return True
 
         except Exception as e:
             _log.error(f'群({group_id})自动发送总结执行失败: {e}')
             return False
-
