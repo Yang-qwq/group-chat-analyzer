@@ -6,6 +6,7 @@ from functools import partial
 from ncatbot.core import registrar
 from ncatbot.event.qq import GroupMessageEvent
 from ncatbot.plugin import NcatBotPlugin
+from ncatbot.utils import get_config_manager
 from ncatbot.utils.logger import get_log
 
 from .command_handler import GroupChatAnalyzerCommandMixin
@@ -46,10 +47,18 @@ class GroupChatAnalyzerPlugin(GroupChatAnalyzerCommandMixin, NcatBotPlugin):
                 'ForceBase64ImageSend': False,
                 'DataRetentionDays': 30,
                 'AutoSendSummary': False,
+                'EnableGroupOwnerAutoAuth': True,
             })
 
             # 注册管理命令所需 RBAC 权限
             self.add_permission('group_chat_analyzer.admin')
+
+            # 自动授予 root（config.yaml 中机器人 owner）全局管理员权限（幂等）
+            root = get_config_manager().config.root
+            if root and self.rbac and not self.check_permission(
+                    root, 'group_chat_analyzer.admin'):
+                self.rbac.grant('user', root, 'group_chat_analyzer.admin')
+                _log.info(f'已自动授予 root({root}) 插件全局管理员权限')
 
             # 初始化数据库（位于插件工作区 data/group_chat_analyzer/）
             self.db = DatabaseManager(str(self.workspace / 'group_chat_data.db'))

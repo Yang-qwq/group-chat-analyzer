@@ -55,8 +55,10 @@ pip install -r requirements.txt
 
 配置采用 NcatBot 5 双层模型：默认值在插件 `on_load()` 通过 `init_defaults()` 注册（下表），可在全局 `config.yaml` 的 `plugin.plugin_configs.group_chat_analyzer` 下覆盖（如 `EnableAutoRecord: false`）。
 
-> 🔑 **管理员权限（RBAC）**：管理命令（`/gcpurge`、`/gcdb`、`/gcautosend`）不再校验 QQ 群管理身份，改为校验 RBAC 权限
-> `group_chat_analyzer.admin`。需通过 NcatBot 的 RBAC 机制为使用者或角色授予该权限，未授权时插件会回复"权限不足"。
+> 🔑 **管理员权限（RBAC）**：管理命令采用三层授权：
+> 1. **全局管理员**（跨群，权限点 `group_chat_analyzer.admin`）— 机器人 owner（`config.yaml` 的 `root`）启动时自动获得；其余管理员由 root 通过 `/gcrbac grant <qq>` 授予
+> 2. **群主/群管理**（本群）— 自动放行 `/gcpurge` `/gcdb` `/gcautosend`，受 `EnableGroupOwnerAutoAuth` 开关控制（默认开）
+> 3. **默认拒绝** — 未授权用户回复"权限不足"；`/gcrbac` 仅全局管理员可用，防止群主提权
 
 ### 配置项
 
@@ -66,6 +68,7 @@ pip install -r requirements.txt
 | `ForceBase64ImageSend` | bool | false  | 是否强制使用 Base64 编码发送图片 |
 | `DataRetentionDays`    | int  | 30     | 数据自动保留天数（0 表示不自动清理）  |
 | `AutoSendSummary`      | bool | false  | 全局总开关：是否允许自动发送群聊总结 |
+| `EnableGroupOwnerAutoAuth` | bool | true | 群主/群管理自动放行本群管理员命令 |
 
 ## 📖 使用指南
 
@@ -115,7 +118,7 @@ pip install -r requirements.txt
 /gcmonthly help
 ```
 
-### 管理命令（管理员专用，需 RBAC 权限 `group_chat_analyzer.admin`）
+### 管理命令（全局管理员或本群群主/群管理）
 
 ```bash
 # 清理旧数据（默认 30 天）
@@ -133,6 +136,22 @@ pip install -r requirements.txt
 # 显示帮助信息
 /gcpurge help
 /gcdb help
+```
+
+### 全局管理员管理命令（仅机器人 owner 或已被 /gcrbac 授权的全局管理员）
+
+```bash
+# 授予指定 QQ 全局管理员权限
+/gcrbac grant <qq>
+
+# 撤销全局管理员权限
+/gcrbac revoke <qq>
+
+# 查看所有全局管理员
+/gcrbac list
+
+# 显示帮助信息
+/gcrbac help
 ```
 
 `/gcautosend` 常用参数：`interval`（daily/weekly/monthly）、`time`（HH:MM）、`weekday`（0=周一）、`monthday`、`scope`（统计小时数，0=自动）。全局开关 `AutoSendSummary` 需开启后计划才会真正发送。
@@ -185,6 +204,7 @@ group_chat_analyzer/
 ├── command_handler.py   # 命令处理模块
 ├── requirements.txt     # Python 依赖
 ├── Pipfile              # Pipenv 依赖管理
+├── tests/               # pytest 测试（权限系统等）
 ├── AGENTS.md            # 开发约定（子模块维护）
 ├── README.md            # 说明文档
 └── LICENSE              # AGPL 许可证

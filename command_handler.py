@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 import base64
+import re
 import shlex
+import time
 from typing import Optional
 
 from ncatbot.core import registrar
 from ncatbot.event.qq import GroupMessageEvent, MessageEvent
+from ncatbot.utils import get_config_manager
 from ncatbot.utils.logger import get_log
 
 _log = get_log('group_chat_analyzer')
@@ -95,9 +98,29 @@ AUTO_SEND_HELP_TEXT = """⏰ /gcautosend - 配置日/周/月自动发送群聊�
   /gcautosend set interval monthly monthday 15
   /gcautosend status"""
 
+GCRBAC_HELP_TEXT = """🔐 /gcrbac - 管理全局管理员（机器人 owner 专用）
+
+用法：
+  /gcrbac grant <qq>        授予指定 QQ 全局管理员权限（支持 @ 成员或纯数字）
+  /gcrbac revoke <qq>       撤销指定 QQ 全局管理员权限（支持 @ 成员或纯数字）
+  /gcrbac list              查看所有全局管理员
+  /gcrbac help              显示本帮助
+
+说明：
+  · 全局管理员可跨群使用本插件全部管理员命令（/gcpurge /gcdb /gcautosend）
+  · 群主/群管理仅可管理本群数据，不能使用本命令
+  · 机器人 owner（config.yaml 中的 root）启动时自动拥有此权限"""
+
+# 兼容 At 组件（CQ 码，如 [CQ:at,qq=888888]）与纯数字两种 QQ 格式；
+# 忽略大小写、允许存在 name 等额外参数，qq=all（@全体成员）不会被匹配
+_AT_CQ_PATTERN = re.compile(r'^\[CQ:at,qq=(\d+)(?:,.*)?\]$', re.IGNORECASE)
+
 
 class GroupChatAnalyzerCommandMixin:
     """命令处理逻辑 Mixin"""
+
+    # 群角色缓存 TTL（秒），避免每次命令都请求群成员列表
+    GROUP_ROLE_CACHE_TTL = 300
 
     async def _send_image(self, event, chart_path: str, caption: str):
         """发送图片消息，支持 Base64 模式
@@ -132,15 +155,70 @@ class GroupChatAnalyzerCommandMixin:
             return None
 
     async def _check_admin(self, event) -> bool:
-        """校验管理员权限（RBAC）
+        """校验管理员权限（全局 RBAC 管理员或本群群主/群管理）
+
+        :param event: 消息事件
+        :return: 是否拥有权限
+        """
+        if await self._check_global_admin(event):
+            return True
+        if await self._is_group_privileged(event):
+            return True
+        await event.reply(text='权限不足：该命令需要管理员权限', at_sender=False)
+        return False
+
+    async def _check_global_admin(self, event) -> bool:
+        """校验全局管理员权限（仅 RBAC，跨群生效）
+
+        用于 /gcrbac 等不允许群主/群管理越权使用的命令。
 
         :param event: 消息事件
         :return: 是否拥有权限
         """
         if self.check_permission(str(event.user_id), 'group_chat_analyzer.admin'):
             return True
-        await event.reply(text='权限不足：该命令需要管理员权限', at_sender=False)
+        await event.reply(text='权限不足：该命令需要全局管理员权限（机器人 owner 或 /gcrbac 授权）',
+                          at_sender=False)
         return False
+
+    async def _is_group_privileged(self, event) -> bool:
+        """校验是否为本群群主或群管理员（受 EnableGroupOwnerAutoAuth 开关控制）
+
+        群角色列表带 TTL 缓存，避免每条命令都调用群成员列表 API。
+
+        :param event: 消息事件
+        :return: 是否拥有本群管理权限
+        """
+        if not isinstance(event, GroupMessageEvent):
+            return False
+        if not self.get_config('EnableGroupOwnerAutoAuth', True):
+            return False
+        group_id = str(event.group_id)
+        user_id = str(event.user_id)
+
+        cache = getattr(self, '_group_role_cache', None)
+        if cache is None:
+            cache = self._group_role_cache = {}
+        entry = cache.get(group_id)
+
+        now = time.time()
+        if not entry or now > entry['expire']:
+            try:
+                members = await self.api.qq.query.get_group_member_list(event.group_id)
+            except Exception as e:
+                _log.warning(f'获取群成员列表失败: {e}')
+                return False
+            roles = {}
+            for member in members:
+                uid = getattr(member, 'user_id', None)
+                role = getattr(member, 'role', None)
+                if uid is not None:
+                    roles[str(uid)] = role
+            entry = {'roles': roles, 'expire': now + self.GROUP_ROLE_CACHE_TTL}
+            cache[group_id] = entry
+            _log.debug(f'已刷新群({group_id})角色缓存，共 {len(roles)} 人')
+
+        return entry['roles'].get(user_id) in ('owner', 'admin')
 
     @staticmethod
     def _validate_hours(hours: int) -> bool:
@@ -159,6 +237,21 @@ class GroupChatAnalyzerCommandMixin:
         :return: 是否有效
         """
         return 1 <= days <= 365
+
+    @staticmethod
+    def _resolve_target_qq(token: str) -> Optional[str]:
+        """解析 /gcrbac 目标 QQ，兼容纯数字与 At 组件（CQ 码）两种格式
+
+        :param token: 命令参数中的目标 QQ（如 "888888" 或 "[CQ:at,qq=888888]"）
+        :return: 归一化的 QQ 号；无法解析（如 @全体成员）时返回 None
+        """
+        token = token.strip()
+        if token.isdigit():
+            return token
+        match = _AT_CQ_PATTERN.match(token)
+        if match:
+            return match.group(1)
+        return None
 
     async def _refresh_user_names(self, event) -> None:
         """通过 API 获取群成员列表，刷新用户名缓存
@@ -793,3 +886,95 @@ class GroupChatAnalyzerCommandMixin:
 
         else:
             await event.reply(text=AUTO_SEND_HELP_TEXT, at_sender=False)
+
+    @registrar.qq.on_command('/gcrbac')
+    async def on_rbac(self, event: MessageEvent):
+        """处理 /gcrbac 命令，管理全局管理员权限（仅全局管理员/root 可用）
+
+        :param event: 消息事件
+        :return: None
+        """
+        if not await self._check_global_admin(event):
+            return
+
+        params = await self._safe_params(event)
+        if params is None:
+            return
+
+        if len(params) < 1 or params[0] == 'help':
+            await event.reply(text=GCRBAC_HELP_TEXT, at_sender=False)
+            return
+
+        subcommand = params[0]
+
+        if subcommand == 'grant':
+            if len(params) != 2:
+                await event.reply(text='用法：/gcrbac grant <qq>（支持 @ 成员或纯数字）', at_sender=False)
+                return
+            target = self._resolve_target_qq(params[1])
+            if target is None:
+                await event.reply(text='QQ 号必须是纯数字或 @ 成员', at_sender=False)
+                return
+            _log.debug(f'{event.user_id} 通过 /gcrbac grant 指定目标: {target}（原文: {params[1]}）')
+            if not self.rbac:
+                await event.reply(text='RBAC 服务不可用，无法授权', at_sender=False)
+                return
+            if self.check_permission(target, 'group_chat_analyzer.admin'):
+                await event.reply(text=f'用户 {target} 已是全局管理员', at_sender=False)
+                return
+            try:
+                self.rbac.add_user(target, exist_ok=True)
+                self.rbac.grant('user', target, 'group_chat_analyzer.admin')
+            except Exception as e:
+                _log.error(f'授予全局管理员权限失败: {e}')
+                await event.reply(text=f'授予全局管理员权限失败: {e}', at_sender=False)
+                return
+            _log.info(f'{event.user_id} 通过 /gcrbac 授予 {target} 全局管理员权限')
+            await event.reply(text=f'✅ 已授予 {target} 全局管理员权限', at_sender=False)
+
+        elif subcommand == 'revoke':
+            if len(params) != 2:
+                await event.reply(text='用法：/gcrbac revoke <qq>（支持 @ 成员或纯数字）', at_sender=False)
+                return
+            target = self._resolve_target_qq(params[1])
+            if target is None:
+                await event.reply(text='QQ 号必须是纯数字或 @ 成员', at_sender=False)
+                return
+            _log.debug(f'{event.user_id} 通过 /gcrbac revoke 指定目标: {target}（原文: {params[1]}）')
+            if not self.rbac:
+                await event.reply(text='RBAC 服务不可用，无法撤销', at_sender=False)
+                return
+            if not self.check_permission(target, 'group_chat_analyzer.admin'):
+                await event.reply(text=f'用户 {target} 不是全局管理员', at_sender=False)
+                return
+            try:
+                self.rbac.revoke('user', target, 'group_chat_analyzer.admin')
+            except Exception as e:
+                _log.error(f'撤销全局管理员权限失败: {e}')
+                await event.reply(text=f'撤销全局管理员权限失败: {e}', at_sender=False)
+                return
+            _log.info(f'{event.user_id} 通过 /gcrbac 撤销 {target} 全局管理员权限')
+            await event.reply(text=f'✅ 已撤销 {target} 的全局管理员权限', at_sender=False)
+
+        elif subcommand == 'list':
+            if not self.rbac:
+                await event.reply(text='RBAC 服务不可用', at_sender=False)
+                return
+            root = get_config_manager().config.root
+            admins = [
+                uid for uid in self.rbac.users
+                if self.check_permission(uid, 'group_chat_analyzer.admin')
+            ]
+            if not admins:
+                await event.reply(
+                    text='当前暂无全局管理员（root 将在下次启动时自动恢复授权）',
+                    at_sender=False)
+                return
+            lines = [f'🔐 全局管理员列表（共 {len(admins)} 人）：', '']
+            for i, uid in enumerate(admins, 1):
+                root_mark = '（root）' if uid == root else ''
+                lines.append(f'  {i}. {uid}{root_mark}')
+            await event.reply(text='\n'.join(lines), at_sender=False)
+
+        else:
+            await event.reply(text=GCRBAC_HELP_TEXT, at_sender=False)
