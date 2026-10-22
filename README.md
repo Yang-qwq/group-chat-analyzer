@@ -53,7 +53,22 @@ pip install -r requirements.txt
 
 插件会自动加载，无需额外配置。数据库存储在插件工作区 `data/group_chat_analyzer/`，图表临时存储在系统临时目录中。
 
-配置采用 NcatBot 5 双层模型：默认值在插件 `on_load()` 通过 `init_defaults()` 注册（下表），可在全局 `config.yaml` 的 `plugin.plugin_configs.group_chat_analyzer` 下覆盖（如 `EnableAutoRecord: false`）。
+配置采用 NcatBot 5 双层模型：默认值在插件 `on_load()` 通过 `init_defaults()` 注册（下表），可在全局 `config.yaml` 的 `plugin.plugin_configs` 段下覆盖。
+
+> ⚠️ **配置段键名必须与插件名完全一致**
+>
+> 框架按插件 `name`（`manifest.toml` 的 `name` = `group_chat_analyzer`）精确查找覆盖配置，**不做任何名称归一化**。键名写成目录名（`GroupChatAnalyzer`）、类名（`GroupChatAnalyzerPlugin`）等都会导致覆盖**静默不生效**（不报错、不告警，回落到默认值）。
+>
+> ```yaml
+> plugin:
+>   plugin_configs:
+>     group_chat_analyzer:     # ✅ 正确：与 manifest.toml 的 name 一致
+>       AutoSendSummary: true
+>     # GroupChatAnalyzerPlugin:   # ❌ 错误：键名不匹配，配置不会生效
+>     #   AutoSendSummary: true
+> ```
+>
+> 手动修改 `config.yaml` 后需**重启机器人**才能生效（框架不会因配置文件变更而热重载插件）。
 
 > 🔑 **管理员权限（RBAC）**：管理命令采用三层授权：
 > 1. **全局管理员**（跨群，权限点 `group_chat_analyzer.admin`）— 机器人 owner（`config.yaml` 的 `root`）启动时自动获得；其余管理员由 root 通过 `/gcrbac grant <qq>` 授予
@@ -234,6 +249,15 @@ apt install fonts-wqy-zenhei fonts-wqy-microhei
 - 确认有足够的历史消息数据
 - 检查 matplotlib 是否正确安装
 - 查看日志获取详细错误信息
+
+### 自动发送计划已注册但到点不发送
+定时任务会**无条件注册**（日志出现"已注册群(...)自动发送计划"），但到点触发时会依次检查，任一不通过都会**静默跳过**：
+- 全局开关 `AutoSendSummary` 为 `false`（最常见原因）— 先确认 `config.yaml` 的 `plugin_configs` 段键名为 `group_chat_analyzer` 且已重启（见上文 ⚠️ 提示）
+- 当日/当周/当月已发送过（`last_send` 防重复）
+- 统计时间范围内无消息（可用 `/gcdb` 或 `/gcanalyze` 确认数据）
+- 周/月计划当天不是设定的 `weekday` / `monthday`
+
+开启 `debug: true` 后，日志中 `group_chat_analyzer` 模块会输出具体跳过原因（如"自动发送已关闭（全局开关），跳过"）。
 
 ## 许可证
 

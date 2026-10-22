@@ -10,7 +10,8 @@ ncatbot 插件（NcatBot 5），自动记录 QQ 群消息到 SQLite 并生成统
 
 ## 测试要求
 
-- 测试文件放 `tests/`（当前仅 `test_permission.py`），用 `ncatbot.testing.PluginTestHarness` + MockAdapter 离线驱动，文件必须 `pytestmark = pytest.mark.asyncio(mode="strict")`
+- 测试文件放 `tests/`（`test_permission.py` + `test_config.py`），用 `ncatbot.testing.PluginTestHarness` + MockAdapter 离线驱动，文件必须 `pytestmark = pytest.mark.asyncio(mode="strict")`
+- **pytest 预导入陷阱**：测试位于含 `__init__.py` 的插件包内时，pytest 会在 setup 阶段预导入顶层 `__init__.py`（级联导入全部子模块），该次导入发生在插件上下文之外，导致进程内**第一个 harness 注册 0 个 handler**（事件注入丢失）。`tests/conftest.py` 用 autouse fixture 在每个用例前清理 `sys.modules` 中的 `GroupChatAnalyzer.*` 缓存与 `__global__` pending 修复，勿删
 - **必须隔离真实数据**：每个用例 `monkeypatch.chdir(tmp_path)`（RBAC `data/rbac.json`、插件 workspace 均为相对路径）+ `tests/conftest.py` 提前设置 `NCATBOT_CONFIG_PATH` 指向 `tests/ncatbot_test_config.yaml`（root=123456），禁止触碰仓库根目录真实 `config.yaml` / `data/`
 - 事件经 `h.inject(group_message(...))` 注入走真实分发链路；API 行为用 MockAdapter 精确断言：`h.assert_api(action).called()/not_called()/with_params()/with_text()`、`h.mock_api_for("qq").call_count(action)`、`mock.set_response(action, ...)` 预设返回
 - 新增/修改权限逻辑时，用例必须断言底层 API 行为（如 `get_group_member_list` 是否被调用、角色缓存命中次数、严格 RBAC 路径不查询群角色），而非仅断言回复文本
